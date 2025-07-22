@@ -5,6 +5,7 @@ import {
   DeleteFunctionCommand,
 } from "@aws-sdk/client-lambda";
 import chalk from "chalk";
+import inquirer from "inquirer";
 
 export class AWSCleaner {
   constructor(options) {
@@ -18,26 +19,45 @@ export class AWSCleaner {
 
   async listFunctions() {
     try {
-      const command = new ListFunctionsCommand({});
-      const response = await this.client.send(command);
+      let allFunctions = [];
+      let marker = undefined;
 
-      let functions = response.Functions.map((func) => ({
-        name: func.FunctionName,
-        arn: func.FunctionArn,
-        runtime: func.Runtime,
-        lastModified: func.LastModified,
-      }));
+      do {
+        const command = new ListFunctionsCommand({
+          Marker: marker,
+          MaxItems: 50,
+        });
+
+        const response = await this.client.send(command);
+
+        const functions = response.Functions.map((func) => ({
+          name: func.FunctionName,
+          arn: func.FunctionArn,
+          runtime: func.Runtime,
+          lastModified: func.LastModified,
+        }));
+
+        allFunctions = allFunctions.concat(functions);
+        marker = response.NextMarker;
+
+        // 진행 상황 표시
+        console.log(
+          chalk.gray(
+            `📋 함수 목록 가져오는 중... ${allFunctions.length}개 발견`
+          )
+        );
+      } while (marker);
 
       // 특정 함수 이름이 지정된 경우 필터링
       if (this.functionName) {
-        functions = functions.filter(
+        allFunctions = allFunctions.filter(
           (func) =>
             func.name === this.functionName ||
             func.name.includes(this.functionName)
         );
       }
 
-      return functions;
+      return allFunctions;
     } catch (error) {
       throw new Error(
         `AWS Lambda 함수 목록을 가져오는데 실패했습니다: ${error.message}`
@@ -57,30 +77,60 @@ export class AWSCleaner {
 
     let totalDeleted = 0;
     let totalSaved = 0;
+    let processedCount = 0;
+    let errorCount = 0;
 
     // 각 함수별로 정리 작업 수행
     for (const func of functions) {
-      console.log(chalk.cyan(`\n🔍 ${func.name} 분석 중...`));
+      processedCount++;
+      console.log(
+        chalk.cyan(
+          `\n🔍 [${processedCount}/${functions.length}] ${func.name} 분석 중...`
+        )
+      );
 
-      const result = await this.cleanupFunction(func);
+      try {
+        const result = await this.cleanupFunction(func);
 
-      if (result.deleted > 0) {
-        console.log(chalk.green(`  ✅ ${result.deleted}개 버전 삭제됨`));
-        totalDeleted += result.deleted;
-      } else {
-        console.log(chalk.yellow(`  ℹ️  삭제할 버전이 없음`));
-      }
+        if (result.deleted > 0) {
+          console.log(chalk.green(`  ✅ ${result.deleted}개 버전 삭제됨`));
+          totalDeleted += result.deleted;
+        } else {
+          console.log(chalk.yellow(`  ℹ️  삭제할 버전이 없음`));
+        }
 
-      if (result.saved > 0) {
-        console.log(chalk.blue(`  💾 ${result.saved}개 버전 보존됨`));
-        totalSaved += result.saved;
+        if (result.saved > 0) {
+          console.log(chalk.blue(`  💾 ${result.saved}개 버전 보존됨`));
+          totalSaved += result.saved;
+        }
+      } catch (error) {
+        errorCount++;
+        console.log(
+          chalk.red(`  ❌ ${func.name} 처리 중 오류: ${error.message}`)
+        );
+
+        // 오류가 발생해도 계속 진행할지 확인
+        if (!this.dryRun && !this.options.force) {
+          const { continueProcessing } = await this.confirmContinue();
+          if (!continueProcessing) {
+            console.log(chalk.yellow(`\n⏹️  사용자에 의해 중단되었습니다.`));
+            break;
+          }
+        }
       }
     }
 
     // 결과 요약
     console.log(chalk.bold.green(`\n🎉 정리 완료!`));
+    console.log(
+      chalk.green(`  처리된 함수: ${processedCount}/${functions.length}개`)
+    );
     console.log(chalk.green(`  삭제된 버전: ${totalDeleted}개`));
     console.log(chalk.blue(`  보존된 버전: ${totalSaved}개`));
+
+    if (errorCount > 0) {
+      console.log(chalk.red(`  오류 발생: ${errorCount}개 함수`));
+    }
 
     if (this.dryRun) {
       console.log(
@@ -89,6 +139,23 @@ export class AWSCleaner {
         )
       );
     }
+  }
+
+  async confirmContinue() {
+    const { continueProcessing } = await inquirer.prompt([
+      {
+        type: "confirm",
+        name: "continueProcessing",
+        message: "오류가 발생했습니다. 계속 진행하시겠습니까?",
+        default: true,
+      },
+    ]);
+
+    return { continueProcessing };
+  }
+
+  async delay(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   async cleanupFunction(func) {
@@ -141,6 +208,9 @@ export class AWSCleaner {
             await this.client.send(deleteCommand);
             console.log(chalk.green(`    ✅ 버전 ${version.Version} 삭제됨`));
             deletedCount++;
+
+            // AWS API 호출 제한을 고려한 지연
+            await this.delay(100);
           } catch (error) {
             console.log(
               chalk.red(
